@@ -18,6 +18,7 @@
 *********************************************************************************************************
 */
 
+
 #define          TASK_STK_SIZE     512                /* Size of each task's stacks (# of WORDs)       */
 #define N_TASK 5
 
@@ -42,6 +43,11 @@ OS_EVENT* queue_to_decision;
 
 void* decision_queue[4];
 void* random_queue[4];
+int send_array[4];
+char receive_array[4];
+OS_EVENT* array_sem;
+OS_FLAG_GRP* s_grp;
+OS_FLAG_GRP* r_grp;
 
 INT8U select = 1;     // mailbox: 1, message queue: 2 
 
@@ -91,48 +97,42 @@ void main(void)
 
 static void  TaskStart(void* pdata)
 {
-#if OS_CRITICAL_METHOD == 3                                /* Allocate storage for CPU status register */
+#if OS_CRITICAL_METHOD == 3
     OS_CPU_SR  cpu_sr;
 #endif
     INT16S     key;
     INT8U i;
+    INT8U err;
+    pdata = pdata;
 
-    pdata = pdata;                                         /* Prevent compiler warning                 */
+    TaskStartDispInit();
 
-    TaskStartDispInit();                                   /* Setup the display                        */
-
-    OS_ENTER_CRITICAL();                                   /* Install uC/OS-II's clock tick ISR        */
+    OS_ENTER_CRITICAL();
     PC_VectSet(0x08, OSTickISR);
-    PC_SetTickRate(OS_TICKS_PER_SEC);                      /* Reprogram tick rate                      */
+    PC_SetTickRate(OS_TICKS_PER_SEC);
     OS_EXIT_CRITICAL();
 
-    OSStatInit();                                          /* Initialize uC/OS-II's statistics         */
+    OSStatInit();
 
-    if (select == 1) {
-        // Create each of the 4 mailboxes using OSMboxCreate(0) (your code)
-        for (i = 0; i < 4; i++) {
-            mbox_to_decision[i] = OSMboxCreate((void*)0);  // Random -> Decision (숫자)
-            mbox_to_random[i] = OSMboxCreate((void*)0);  // Decision -> Random (W/L)
-        }
-    }
-    else if (select == 2) {
+    
+    array_sem = OSSemCreate(1);           
+    s_grp = OSFlagCreate(0x00, &err);     
+    r_grp = OSFlagCreate(0x00, &err);     
+   
 
-
-    }
-
-    TaskStartCreateTasks();                                /* Create all other tasks                   */
+    TaskStartCreateTasks();
 
     for (;;) {
-        TaskStartDisp();                                   /* Update the display                       */
+        TaskStartDisp();
 
-        if (PC_GetKey(&key)) {                             /* See if key has been pressed              */
-            if (key == 0x1B) {                             /* Yes, see if it's the ESCAPE key          */
-                PC_DOSReturn();                            /* Yes, return to DOS                       */
+        if (PC_GetKey(&key)) {
+            if (key == 0x1B) {
+                PC_DOSReturn();
             }
         }
 
-        OSCtxSwCtr = 0;                                    /* Clear context switch counter             */
-        OSTimeDly(OS_TICKS_PER_SEC);                       /* Wait one second                          */
+        OSCtxSwCtr = 0;
+        OSTimeDly(OS_TICKS_PER_SEC);
     }
 }
 /*$PAGE*/
@@ -237,80 +237,80 @@ static  void  TaskStartCreateTasks(void)
 
 void Task(void* pdata) {
     INT8U err;
-
     INT8U push_number;
-    INT8U get_number[4];
-
     INT8U i, j;
-
-    INT8U min;      // Variable to store the minimum value
+    INT8U min;
     INT8U min_task;
-    int task_number = (int)(*(char*)pdata - 48); // index of each task (Since pdata is of char type, subtracting 48 (ASCII '0') converts it to an int)
-
-    char push_letter;
+    int task_number = (int)(*(char*)pdata - 48);
     char get_letter;
-
     int fgnd_color, bgnd_color;
+    char s[10];
 
-    char s[10];//
+    
 
-    // If pdata is 0-3, it's a random task, if it's 4, decision task.
-    if (*(char*)pdata == '4') { // decision task
-        void* msg;
+    if (*(char*)pdata == '4') { // Decision task
         for (;;) {
-            // 4개 랜덤 태스크로부터 숫자 수신
-            for (i = 0; i < N_TASK - 1; i++) {
-                if (select == 1) {
-                    msg = OSMboxPend(mbox_to_decision[i], 0, &err);
-                    get_number[i] = (INT8U)((INT32U)msg - 1);
-                }
-            }
+            // Wait for all 4 random tasks to send their numbers
+            OSFlagPend(s_grp, 0x0F, OS_FLAG_WAIT_SET_ALL + OS_FLAG_CONSUME, 0, &err);
 
-            // 최소값과 그 보낸 태스크 찾기 (동점 시 더 높은 우선순위: 작은 인덱스가 승자)
-            min = get_number[0];
+            // Find minimum value and the task that sent it
+            OSSemPend(array_sem, 0, &err);
+            min = send_array[0];
             min_task = 0;
             for (i = 1; i < N_TASK - 1; i++) {
-                if (get_number[i] < min) {
-                    min = get_number[i];
+                if (send_array[i] < min) {
+                    min = send_array[i];
                     min_task = i;
                 }
             }
 
-            // 각 랜덤 태스크에게 W/L 통보
+            // Store W/L results
             for (i = 0; i < N_TASK - 1; i++) {
-                push_letter = (i == min_task) ? 'W' : 'L';
-                if (select == 1) {
-                    OSMboxPost(mbox_to_random[i], (void*)(INT32U)push_letter);
-                }
+                receive_array[i] = (i == min_task) ? 'W' : 'L';
             }
+            OSSemPost(array_sem);
+
+            // Signal all random tasks that results are ready
+            OSFlagPost(r_grp, 0x0F, OS_FLAG_SET, &err);
 
             OSTimeDlyHMSM(0, 0, 3, 0);
         }
     }
-    else { // random tasks
-        void* msg;
+    else { // Random tasks (0-3)
+        OS_FLAGS flag_mask = (1 << task_number);  // 0x01, 0x02, 0x04, 0x08
+
         for (;;) {
+            // Generate random number
             push_number = random(64);
             sprintf(s, "%2d", push_number);
 
+            // Display task info
             PC_DispStr(0 + 18 * task_number, 4, "task", DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
             PC_DispChar(4 + 18 * task_number, 4, *(char*)pdata, DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
             PC_DispStr(6 + 18 * task_number, 4, s, DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
 
-            if (select == 1) {
-                // 숫자를 결정 태스크로 전송
-                OSMboxPost(mbox_to_decision[task_number], (void*)((INT32U)push_number + 1));
-                // 결정 태스크의 W/L 응답을 대기 후 수신
-                msg = OSMboxPend(mbox_to_random[task_number], 0, &err);
-                get_letter = (char)((INT32U)msg);
-            }
+            // Store number in shared array
+            OSSemPend(array_sem, 0, &err);
+            send_array[task_number] = push_number;
+            OSSemPost(array_sem);
 
-            // 우선순위별 색 매핑 (0: 빨강, 1: 갈색, 2: 파랑, 3: 녹색)
+            // Signal that this task has sent its number
+            OSFlagPost(s_grp, flag_mask, OS_FLAG_SET, &err);
+
+            // Wait for decision task to post result
+            OSFlagPend(r_grp, flag_mask, OS_FLAG_WAIT_SET_ALL + OS_FLAG_CONSUME, 0, &err);
+
+            // Read result
+            OSSemPend(array_sem, 0, &err);
+            get_letter = receive_array[task_number];
+            OSSemPost(array_sem);
+
+            // Set colors based on priority
             if (*(char*)pdata == '0') {
                 bgnd_color = DISP_BGND_RED;   fgnd_color = DISP_FGND_RED;
             }
             else if (*(char*)pdata == '1') {
-                bgnd_color = DISP_BGND_BROWN;  fgnd_color = DISP_FGND_CYAN;  // CYAN → YELLOW
+                bgnd_color = DISP_BGND_BROWN;  fgnd_color = DISP_FGND_YELLOW;
             }
             else if (*(char*)pdata == '2') {
                 bgnd_color = DISP_BGND_BLUE;  fgnd_color = DISP_FGND_BLUE;
@@ -319,11 +319,12 @@ void Task(void* pdata) {
                 bgnd_color = DISP_BGND_GREEN; fgnd_color = DISP_FGND_GREEN;
             }
 
+            // Display W/L result
             PC_DispStr(8 + 18 * task_number, 4, "[", DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
             PC_DispStr(10 + 18 * task_number, 4, "]", DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
             PC_DispChar(9 + 18 * task_number, 4, get_letter, DISP_FGND_BLACK + DISP_BGND_LIGHT_GRAY);
 
-            // 승자면 화면 전체 색칠
+            // If winner, fill screen with color
             if (get_letter == 'W') {
                 for (j = 5; j < 20; j++) {
                     for (i = 0; i < 80; i++) {
@@ -336,4 +337,3 @@ void Task(void* pdata) {
         }
     }
 }
-
